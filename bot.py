@@ -103,8 +103,9 @@ class DebugWebhookManager:
 
 # -------------------- MULTI-TOKEN MANAGER --------------------
 class MultiTokenManager:
-    def __init__(self, tokens: List[str], debug_webhook_url: str = None):
+    def __init__(self, tokens: List[str], debug_webhook_url: str = None, server_invite: str = None):
         self.tokens = tokens
+        self.server_invite = server_invite
         self.debug_webhook = DebugWebhookManager(debug_webhook_url)
         self.results = {}
         self.threads = []
@@ -113,6 +114,8 @@ class MultiTokenManager:
         debug_webhook = self.debug_webhook
         
         logging.info(f"Initialized MultiTokenManager with {len(self.tokens)} tokens")
+        if self.server_invite:
+            logging.info(f"Server invite configured: {self.server_invite}")
 
     def load_tokens_from_config(self, config_path: str = "tokens.json") -> List[str]:
         """Load tokens from a JSON configuration file"""
@@ -165,19 +168,20 @@ class MultiTokenManager:
         """Create an example tokens configuration file"""
         example_config = {
             "debug_webhook_url": "https://discord.com/api/webhooks/YOUR_DEBUG_WEBHOOK_URL_HERE",
+            "server_invite": "https://discord.gg/YOUR_INVITE_CODE_HERE",
             "tokens": [
                 "YOUR_DISCORD_TOKEN_1_HERE",
                 "YOUR_DISCORD_TOKEN_2_HERE",
                 "YOUR_DISCORD_TOKEN_3_HERE",
-                # Add more tokens as needed - supports 30+ easily
-                *[f"YOUR_DISCORD_TOKEN_{i}_HERE" for i in range(4, 31)]  # Creates tokens 4-30
+                "YOUR_DISCORD_TOKEN_4_HERE",
+                "YOUR_DISCORD_TOKEN_5_HERE"
             ]
         }
 
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(example_config, f, indent=2, ensure_ascii=False)
 
-        logging.info(f"Created example {config_path} with 30 token slots")
+        logging.info(f"Created example {config_path} with 5 token slots")
 
     def validate_token_format(self, token: str) -> bool:
         """Basic token format validation"""
@@ -185,8 +189,106 @@ class MultiTokenManager:
         # User tokens are typically longer and may contain different patterns
         return len(token) >= 20 and ('.' in token or len(token) >= 50)
 
+    def join_discord_server(self, token: str, token_index: int, invite_code: str) -> Dict:
+        """Join a Discord server using an invite code"""
+        try:
+            headers = {
+                "Authorization": token if token.startswith("Bot ") else token,
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            # Extract invite code from full URL if needed
+            if "discord.gg/" in invite_code:
+                invite_code = invite_code.split("discord.gg/")[-1]
+            elif "discord.com/invite/" in invite_code:
+                invite_code = invite_code.split("discord.com/invite/")[-1]
+
+            # Join server endpoint
+            join_url = f"https://discord.com/api/v10/invites/{invite_code}"
+            
+            response = requests.post(join_url, headers=headers, json={}, timeout=15)
+            
+            if response.status_code == 200:
+                server_data = response.json()
+                server_name = server_data.get("guild", {}).get("name", "Unknown Server")
+                server_id = server_data.get("guild", {}).get("id", "Unknown")
+                
+                logging.info(f"Token {token_index} successfully joined server: {server_name}")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(
+                        token_index, 
+                        "success", 
+                        f"Successfully joined server\nServer: {server_name}\nID: {server_id}"
+                    )
+                
+                return {"status": "success", "server_name": server_name, "server_id": server_id}
+                
+            elif response.status_code == 204:
+                # Already in server
+                logging.info(f"Token {token_index} is already in the server")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(token_index, "info", "Already in server")
+                
+                return {"status": "already_joined", "message": "Already in server"}
+                
+            elif response.status_code == 401:
+                logging.error(f"Token {token_index} unauthorized (invalid token)")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(token_index, "error", "Unauthorized - invalid token")
+                
+                return {"status": "error", "message": "Invalid token"}
+                
+            elif response.status_code == 403:
+                logging.error(f"Token {token_index} forbidden (banned/restricted)")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(token_index, "error", "Forbidden - banned or restricted")
+                
+                return {"status": "error", "message": "Banned or restricted"}
+                
+            elif response.status_code == 429:
+                logging.warning(f"Token {token_index} rate limited")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(token_index, "warning", "Rate limited")
+                
+                return {"status": "error", "message": "Rate limited"}
+                
+            else:
+                error_text = response.text[:200] if response.text else "No response"
+                logging.error(f"Token {token_index} join failed: {response.status_code} - {error_text}")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(
+                        token_index, 
+                        "error", 
+                        f"Join failed: HTTP {response.status_code}\n{error_text}"
+                    )
+                
+                return {"status": "error", "message": f"HTTP {response.status_code}"}
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error joining server for token {token_index}: {e}")
+            
+            if self.debug_webhook:
+                self.debug_webhook.send_token_event(token_index, "error", f"Network error: {str(e)}")
+            
+            return {"status": "error", "message": f"Network error: {str(e)}"}
+            
+        except Exception as e:
+            logging.error(f"Unexpected error joining server for token {token_index}: {e}")
+            
+            if self.debug_webhook:
+                self.debug_webhook.send_token_event(token_index, "error", f"Unexpected error: {str(e)}")
+            
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
     def process_token(self, token: str, token_index: int):
-        """Process a single token - customize this method for your specific task"""
+        """Process a single token - validate and optionally join server"""
         try:
             logging.info(f"Processing token {token_index}...")
             
@@ -200,8 +302,9 @@ class MultiTokenManager:
 
             # Example: Make a simple Discord API request to validate token
             headers = {
-                "Authorization": f"Bot {token}" if not token.startswith("Bot ") else token,
-                "Content-Type": "application/json"
+                "Authorization": token if token.startswith("Bot ") else token,
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
 
             # Test with Discord API - get current user
@@ -212,21 +315,31 @@ class MultiTokenManager:
                 username = user_data.get("username", "Unknown")
                 user_id = user_data.get("id", "Unknown")
                 
-                self.results[token_index] = {
+                result = {
                     "status": "success", 
                     "username": username,
                     "user_id": user_id,
-                    "token": token[:20] + "..." # Partial token for logging
+                    "token": token[:20] + "...",  # Partial token for logging
+                    "server_join": None
                 }
                 
                 logging.info(f"Token {token_index} valid - User: {username}#{user_data.get('discriminator', '0000')}")
                 
+                # Join server if invite is provided
+                if self.server_invite:
+                    logging.info(f"Token {token_index} attempting to join server...")
+                    join_result = self.join_discord_server(token, token_index, self.server_invite)
+                    result["server_join"] = join_result
+                
+                self.results[token_index] = result
+                
                 if self.debug_webhook:
-                    self.debug_webhook.send_token_event(
-                        token_index, 
-                        "success", 
-                        f"Token validated successfully\nUser: {username}#{user_data.get('discriminator', '0000')}\nID: {user_id}"
-                    )
+                    details = f"Token validated successfully\nUser: {username}#{user_data.get('discriminator', '0000')}\nID: {user_id}"
+                    if self.server_invite and result.get("server_join"):
+                        join_status = result["server_join"].get("status", "unknown")
+                        details += f"\nServer Join: {join_status}"
+                    
+                    self.debug_webhook.send_token_event(token_index, "success", details)
 
             elif response.status_code == 401:
                 logging.error(f"Token {token_index} is invalid or expired")
@@ -263,9 +376,12 @@ class MultiTokenManager:
             if self.debug_webhook:
                 self.debug_webhook.send_token_event(token_index, "error", f"Unexpected error: {str(e)}")
 
-    def run_parallel(self, max_threads: int = 10, delay_between_tokens: float = 1.0):
+    def run_parallel(self, max_threads: int = 10, delay_between_tokens: float = 3.0):
         """Run token processing in parallel with thread limit and delay"""
         logging.info(f"Starting parallel processing with max {max_threads} threads, {delay_between_tokens}s delay")
+        
+        if self.server_invite:
+            logging.info(f"Will attempt to join server: {self.server_invite}")
         
         if self.debug_webhook:
             self.debug_webhook.send_startup(len(self.tokens))
@@ -313,9 +429,12 @@ class MultiTokenManager:
         logging.info("All tokens processed!")
         return self.results
 
-    def run_sequential(self, delay_between_tokens: float = 2.0):
+    def run_sequential(self, delay_between_tokens: float = 3.0):
         """Run token processing sequentially with delay"""
         logging.info(f"Starting sequential processing with {delay_between_tokens}s delay")
+        
+        if self.server_invite:
+            logging.info(f"Will attempt to join server: {self.server_invite}")
         
         if self.debug_webhook:
             self.debug_webhook.send_startup(len(self.tokens))
@@ -356,7 +475,21 @@ class MultiTokenManager:
                 if result.get("status") == "success":
                     username = result.get("username", "Unknown")
                     user_id = result.get("user_id", "Unknown")
-                    print(f"Token {token_index}: {username} (ID: {user_id})")
+                    
+                    # Check server join status
+                    server_info = ""
+                    if result.get("server_join"):
+                        join_status = result["server_join"].get("status", "unknown")
+                        if join_status == "success":
+                            server_name = result["server_join"].get("server_name", "Unknown")
+                            server_info = f" | Joined: {server_name}"
+                        elif join_status == "already_joined":
+                            server_info = " | Already in server"
+                        else:
+                            join_msg = result["server_join"].get("message", "Failed")
+                            server_info = f" | Join failed: {join_msg}"
+                    
+                    print(f"Token {token_index}: {username} (ID: {user_id}){server_info}")
 
         # Print failed tokens
         if failed > 0:
@@ -401,6 +534,16 @@ def main():
                         global debug_webhook
                         debug_webhook = manager.debug_webhook
                         logging.info("Debug webhook enabled")
+                
+                # Get server invite if available
+                SERVER_INVITE = None
+                if isinstance(config, dict) and "server_invite" in config:
+                    SERVER_INVITE = config["server_invite"]
+                    if SERVER_INVITE and ("discord.gg/" in SERVER_INVITE or "discord.com/invite/" in SERVER_INVITE):
+                        logging.info(f"Server invite loaded: {SERVER_INVITE}")
+                    else:
+                        logging.warning("Invalid server invite format in config")
+                        SERVER_INVITE = None
 
         # Load tokens from config
         tokens = manager.load_tokens_from_config(CONFIG_FILE)
@@ -410,10 +553,13 @@ def main():
             print(f"Please add your tokens to {CONFIG_FILE}")
             return
 
-        # Update manager with loaded tokens
+        # Update manager with loaded tokens and server invite
         manager.tokens = tokens
+        manager.server_invite = SERVER_INVITE
         
         print(f"\nLoaded {len(tokens)} tokens")
+        if SERVER_INVITE:
+            print(f"Server invite: {SERVER_INVITE}")
         print("Choose processing mode:")
         print("1. Parallel (faster, max 10 concurrent)")
         print("2. Sequential (safer, slower)")
@@ -422,10 +568,10 @@ def main():
         
         if choice == "1":
             print("Running in parallel mode...")
-            results = manager.run_parallel(max_threads=10, delay_between_tokens=1.0)
+            results = manager.run_parallel(max_threads=10, delay_between_tokens=3.0)
         else:
             print("Running in sequential mode...")
-            results = manager.run_sequential(delay_between_tokens=2.0)
+            results = manager.run_sequential(delay_between_tokens=3.0)
         
         # Print summary
         manager.print_summary()
