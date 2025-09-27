@@ -37,7 +37,7 @@ pip install websocket-client
 1. Clone this repository:
 
    ```bash
-   git clone https://github.com/yourusername/token-onliner.git
+   git clone https://github.com/geconfronteerd/token-onliner
    cd token-onliner
    ```
 
