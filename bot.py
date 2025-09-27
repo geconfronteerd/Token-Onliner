@@ -3,9 +3,15 @@ import json
 import time
 import threading
 import requests
+import websocket
 import logging
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import List, Dict
+import signal
+import sys
+
+# Constants
+DISCORD_GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +22,7 @@ logging.basicConfig(
 
 # Global debug webhook manager
 debug_webhook = None
+
 
 # -------------------- DEBUG WEBHOOK MANAGER --------------------
 class DebugWebhookManager:
@@ -33,11 +40,11 @@ class DebugWebhookManager:
         for attempt in range(self.max_retries):
             try:
                 embed = {
-                    "title": f"🔧 Debug: {title}",
-                    "description": description[:4000],  # Discord limit
+                    "title": f"🟢 {title}",
+                    "description": description[:4000],
                     "color": color,
                     "timestamp": datetime.utcnow().isoformat(),
-                    "footer": {"text": "Token One-Liner Debug System"}
+                    "footer": {"text": "Discord Online Manager"}
                 }
 
                 if fields:
@@ -45,7 +52,7 @@ class DebugWebhookManager:
 
                 payload = {
                     "embeds": [embed],
-                    "username": "Token One-Liner Debug"
+                    "username": "Discord Online Manager"
                 }
 
                 response = requests.post(
@@ -56,14 +63,14 @@ class DebugWebhookManager:
                 )
 
                 if response.status_code == 204:
-                    return  # Success
-                elif response.status_code == 429:  # Rate limited
+                    return
+                elif response.status_code == 429:
                     retry_after = response.json().get('retry_after', self.retry_delay)
                     logging.warning(f"Debug webhook rate limited, retrying after {retry_after}s")
                     time.sleep(retry_after)
                     continue
                 else:
-                    logging.warning(f"Debug webhook failed: {response.status_code} - {response.text[:100]}")
+                    logging.warning(f"Debug webhook failed: {response.status_code}")
 
             except Exception as e:
                 logging.error(f"Debug webhook error (attempt {attempt + 1}): {e}")
@@ -73,26 +80,23 @@ class DebugWebhookManager:
     def send_startup(self, token_count: int):
         """Send startup notification"""
         self.send_debug(
-            "Token One-Liner Started",
-            f"Token one-liner has started successfully with {token_count} tokens",
+            "Online Manager Started",
+            f"Starting Discord Online Manager with {token_count} tokens",
             color=0x00FF00,
             fields=[
-                {"name": "Tokens Loaded", "value": str(token_count), "inline": True},
-                {"name": "Status", "value": "Running", "inline": True}
+                {"name": "Tokens", "value": str(token_count), "inline": True},
+                {"name": "Status", "value": "Starting", "inline": True}
             ]
         )
-
-    def send_shutdown(self, reason: str = "Manual shutdown"):
-        """Send shutdown notification"""
-        self.send_debug("Token One-Liner Stopped", reason, color=0xFFAA00)
 
     def send_token_event(self, token_index: int, event: str, details: str = ""):
         """Send token event notification"""
         colors = {
-            "success": 0x00FF00,
+            "connected": 0x00FF00,
+            "disconnected": 0xFF5555,
             "error": 0xFF0000,
-            "warning": 0xFFAA00,
-            "info": 0x5865F2
+            "reconnecting": 0xFFAA00,
+            "online": 0x00FF00
         }
 
         self.send_debug(
@@ -101,502 +105,435 @@ class DebugWebhookManager:
             color=colors.get(event, 0x5865F2)
         )
 
-# -------------------- MULTI-TOKEN MANAGER --------------------
-class MultiTokenManager:
-    def __init__(self, tokens: List[str], debug_webhook_url: str = None, server_invite: str = None):
+    def send_shutdown(self):
+        """Send shutdown notification"""
+        self.send_debug("Online Manager Stopped", "All tokens have been disconnected", color=0xFFAA00)
+
+
+# -------------------- DISCORD CLIENT --------------------
+class DiscordClient:
+    def __init__(self, token: str, token_index: int):
+        self.token = token
+        self.token_index = token_index
+        self.ws = None
+        self.heartbeat_interval = None
+        self.heartbeat_thread = None
+        self.should_stop = False
+        self.connected = False
+        self.last_heartbeat = None
+        self.user_data = None
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+
+        global debug_webhook
+        self.debug_webhook = debug_webhook
+
+    def connect(self):
+        """Connect to Discord gateway"""
+        self.should_stop = False
+        self.connected = False
+        
+        while not self.should_stop and self.reconnect_attempts < self.max_reconnect_attempts:
+            try:
+                logging.info(f"[Token {self.token_index}] Connecting to Discord...")
+                
+                self.ws = websocket.WebSocketApp(
+                    DISCORD_GATEWAY,
+                    on_open=self.on_open,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close
+                )
+                self.ws.run_forever()
+                
+                # If we reach here, connection was closed
+                if not self.should_stop:
+                    self.reconnect_attempts += 1
+                    if self.reconnect_attempts < self.max_reconnect_attempts:
+                        wait_time = min(30, 5 * self.reconnect_attempts)
+                        logging.info(f"[Token {self.token_index}] Reconnecting in {wait_time}s... (attempt {self.reconnect_attempts})")
+                        time.sleep(wait_time)
+                    else:
+                        logging.error(f"[Token {self.token_index}] Max reconnect attempts reached")
+                        if self.debug_webhook:
+                            self.debug_webhook.send_token_event(
+                                self.token_index, 
+                                "error", 
+                                "Max reconnect attempts reached - giving up"
+                            )
+                        break
+                        
+            except Exception as e:
+                logging.error(f"[Token {self.token_index}] Connection failed: {e}")
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(self.token_index, "error", f"Connection failed: {str(e)}")
+                
+                if not self.should_stop:
+                    self.reconnect_attempts += 1
+                    if self.reconnect_attempts < self.max_reconnect_attempts:
+                        time.sleep(10)
+                    else:
+                        break
+
+    def stop(self):
+        """Stop the client"""
+        logging.info(f"[Token {self.token_index}] Stopping client...")
+        self.should_stop = True
+        self.connected = False
+        if self.ws:
+            self.ws.close()
+
+    def is_healthy(self) -> bool:
+        """Check if client is healthy"""
+        if not self.connected or self.should_stop:
+            return False
+
+        if self.last_heartbeat and self.heartbeat_interval:
+            time_since_heartbeat = (datetime.now() - self.last_heartbeat).total_seconds()
+            if time_since_heartbeat > (self.heartbeat_interval / 1000) * 3:
+                return False
+
+        return True
+
+    def on_open(self, ws):
+        logging.info(f"[Token {self.token_index}] Connected to Discord Gateway")
+        self.connected = True
+        self.reconnect_attempts = 0  # Reset on successful connection
+        
+        if self.debug_webhook:
+            self.debug_webhook.send_token_event(self.token_index, "connected", "Connected to Discord Gateway")
+
+    def heartbeat(self):
+        """Send heartbeat to keep connection alive"""
+        while (self.heartbeat_interval and self.ws and self.ws.sock and
+               self.ws.sock.connected and not self.should_stop):
+            try:
+                self.ws.send(json.dumps({"op": 1, "d": None}))
+                self.last_heartbeat = datetime.now()
+                time.sleep(self.heartbeat_interval / 1000)
+            except Exception as e:
+                logging.error(f"[Token {self.token_index}] Heartbeat error: {e}")
+                break
+
+    def on_message(self, ws, message):
+        try:
+            packet = json.loads(message)
+            op, event, data = packet.get("op"), packet.get("t"), packet.get("d")
+
+            if op == 10:  # Hello - start heartbeat
+                self.heartbeat_interval = data["heartbeat_interval"]
+                logging.info(f"[Token {self.token_index}] Starting heartbeat ({self.heartbeat_interval}ms)")
+                
+                if self.heartbeat_thread:
+                    self.heartbeat_thread = None
+                self.heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
+                self.heartbeat_thread.start()
+
+                # Send identify payload
+                identify_payload = {
+                    "op": 2,
+                    "d": {
+                        "token": self.token,
+                        "intents": 513,  # Basic intents for staying online
+                        "properties": {
+                            "os": "linux",
+                            "browser": "custom",
+                            "device": "custom"
+                        },
+                        "presence": {
+                            "status": "online",
+                            "since": None,
+                            "activities": [],
+                            "afk": False
+                        }
+                    }
+                }
+                ws.send(json.dumps(identify_payload))
+
+            elif event == "READY":
+                user = data["user"]
+                self.user_data = user
+                username = f"{user['username']}#{user.get('discriminator', '0000')}"
+                logging.info(f"[Token {self.token_index}] Now online as {username}")
+                
+                if self.debug_webhook:
+                    self.debug_webhook.send_token_event(
+                        self.token_index, 
+                        "online", 
+                        f"Successfully online as {username}\nID: {user['id']}"
+                    )
+
+            elif op == 11:  # Heartbeat ACK
+                # Heartbeat acknowledged - connection is healthy
+                pass
+
+        except json.JSONDecodeError as e:
+            logging.error(f"[Token {self.token_index}] Failed to decode message: {e}")
+        except Exception as e:
+            logging.error(f"[Token {self.token_index}] Error processing message: {e}")
+
+    def on_error(self, ws, error):
+        logging.error(f"[Token {self.token_index}] WebSocket error: {error}")
+        if self.debug_webhook:
+            self.debug_webhook.send_token_event(self.token_index, "error", f"WebSocket error: {str(error)}")
+
+    def on_close(self, ws, code, msg):
+        self.connected = False
+        logging.warning(f"[Token {self.token_index}] Connection closed (code: {code}, message: {msg})")
+        
+        if self.debug_webhook and not self.should_stop:
+            self.debug_webhook.send_token_event(
+                self.token_index, 
+                "disconnected", 
+                f"Connection closed - Code: {code}"
+            )
+
+
+# -------------------- ONLINE MANAGER --------------------
+class OnlineManager:
+    def __init__(self, tokens: List[str], debug_webhook_url: str = None):
         self.tokens = tokens
-        self.server_invite = server_invite
         self.debug_webhook = DebugWebhookManager(debug_webhook_url)
-        self.results = {}
+        self.clients = []
         self.threads = []
+        self.should_stop = False
         
         global debug_webhook
         debug_webhook = self.debug_webhook
         
-        logging.info(f"Initialized MultiTokenManager with {len(self.tokens)} tokens")
-        if self.server_invite:
-            logging.info(f"Server invite configured: {self.server_invite}")
+        logging.info(f"Initialized OnlineManager with {len(self.tokens)} tokens")
 
-    def load_tokens_from_config(self, config_path: str = "tokens.json") -> List[str]:
-        """Load tokens from a JSON configuration file"""
-        tokens = []
-        
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                
-                # Support multiple config formats
-                if isinstance(config, list):
-                    # Array of token objects: [{"token": "..."}, {"token": "..."}, ...]
-                    for i, token_config in enumerate(config):
-                        if isinstance(token_config, dict) and "token" in token_config:
-                            token = token_config["token"].strip()
-                            if token:
-                                tokens.append(token)
-                                logging.info(f"Loaded token {i + 1} from config")
-                        elif isinstance(token_config, str) and token_config.strip():
-                            # Simple string array: ["token1", "token2", ...]
-                            tokens.append(token_config.strip())
-                            logging.info(f"Loaded token {i + 1} from config")
-                
-                elif isinstance(config, dict):
-                    # Object with tokens array: {"tokens": ["...", "...", ...]}
-                    if "tokens" in config and isinstance(config["tokens"], list):
-                        for i, token in enumerate(config["tokens"]):
-                            if isinstance(token, str) and token.strip():
-                                tokens.append(token.strip())
-                                logging.info(f"Loaded token {i + 1} from config")
-                    
-                    # Object with individual token keys: {"token1": "...", "token2": "...", ...}
-                    else:
-                        for key, value in config.items():
-                            if key.startswith("token") and isinstance(value, str) and value.strip():
-                                tokens.append(value.strip())
-                                logging.info(f"Loaded {key} from config")
-                
-                logging.info(f"Successfully loaded {len(tokens)} tokens from {config_path}")
-                
-            except json.JSONDecodeError as e:
-                logging.error(f"Invalid JSON in {config_path}: {e}")
-            except Exception as e:
-                logging.error(f"Error loading tokens from {config_path}: {e}")
-        
-        return tokens
-
-    def create_example_config(self, config_path: str = "tokens.json"):
-        """Create an example tokens configuration file"""
-        example_config = {
-            "debug_webhook_url": "https://discord.com/api/webhooks/YOUR_DEBUG_WEBHOOK_URL_HERE",
-            "server_invite": "https://discord.gg/YOUR_INVITE_CODE_HERE",
-            "tokens": [
-                "YOUR_DISCORD_TOKEN_1_HERE",
-                "YOUR_DISCORD_TOKEN_2_HERE",
-                "YOUR_DISCORD_TOKEN_3_HERE",
-                "YOUR_DISCORD_TOKEN_4_HERE",
-                "YOUR_DISCORD_TOKEN_5_HERE"
-            ]
-        }
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(example_config, f, indent=2, ensure_ascii=False)
-
-        logging.info(f"Created example {config_path} with 5 token slots")
-
-    def validate_token_format(self, token: str) -> bool:
-        """Basic token format validation"""
-        # Discord bot tokens are typically 24+ chars and contain dots
-        # User tokens are typically longer and may contain different patterns
-        return len(token) >= 20 and ('.' in token or len(token) >= 50)
-
-    def join_discord_server(self, token: str, token_index: int, invite_code: str) -> Dict:
-        """Join a Discord server using an invite code"""
-        try:
-            headers = {
-                "Authorization": token if token.startswith("Bot ") else token,
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-
-            # Extract invite code from full URL if needed
-            if "discord.gg/" in invite_code:
-                invite_code = invite_code.split("discord.gg/")[-1]
-            elif "discord.com/invite/" in invite_code:
-                invite_code = invite_code.split("discord.com/invite/")[-1]
-
-            # Join server endpoint
-            join_url = f"https://discord.com/api/v10/invites/{invite_code}"
-            
-            response = requests.post(join_url, headers=headers, json={}, timeout=15)
-            
-            if response.status_code == 200:
-                server_data = response.json()
-                server_name = server_data.get("guild", {}).get("name", "Unknown Server")
-                server_id = server_data.get("guild", {}).get("id", "Unknown")
-                
-                logging.info(f"Token {token_index} successfully joined server: {server_name}")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(
-                        token_index, 
-                        "success", 
-                        f"Successfully joined server\nServer: {server_name}\nID: {server_id}"
-                    )
-                
-                return {"status": "success", "server_name": server_name, "server_id": server_id}
-                
-            elif response.status_code == 204:
-                # Already in server
-                logging.info(f"Token {token_index} is already in the server")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "info", "Already in server")
-                
-                return {"status": "already_joined", "message": "Already in server"}
-                
-            elif response.status_code == 401:
-                logging.error(f"Token {token_index} unauthorized (invalid token)")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "error", "Unauthorized - invalid token")
-                
-                return {"status": "error", "message": "Invalid token"}
-                
-            elif response.status_code == 403:
-                logging.error(f"Token {token_index} forbidden (banned/restricted)")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "error", "Forbidden - banned or restricted")
-                
-                return {"status": "error", "message": "Banned or restricted"}
-                
-            elif response.status_code == 429:
-                logging.warning(f"Token {token_index} rate limited")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "warning", "Rate limited")
-                
-                return {"status": "error", "message": "Rate limited"}
-                
-            else:
-                error_text = response.text[:200] if response.text else "No response"
-                logging.error(f"Token {token_index} join failed: {response.status_code} - {error_text}")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(
-                        token_index, 
-                        "error", 
-                        f"Join failed: HTTP {response.status_code}\n{error_text}"
-                    )
-                
-                return {"status": "error", "message": f"HTTP {response.status_code}"}
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error joining server for token {token_index}: {e}")
-            
-            if self.debug_webhook:
-                self.debug_webhook.send_token_event(token_index, "error", f"Network error: {str(e)}")
-            
-            return {"status": "error", "message": f"Network error: {str(e)}"}
-            
-        except Exception as e:
-            logging.error(f"Unexpected error joining server for token {token_index}: {e}")
-            
-            if self.debug_webhook:
-                self.debug_webhook.send_token_event(token_index, "error", f"Unexpected error: {str(e)}")
-            
-            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
-
-    def process_token(self, token: str, token_index: int):
-        """Process a single token - validate and optionally join server"""
-        try:
-            logging.info(f"Processing token {token_index}...")
-            
-            # Validate token format
-            if not self.validate_token_format(token):
-                logging.warning(f"Token {token_index} has invalid format")
-                self.results[token_index] = {"status": "error", "message": "Invalid token format"}
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "warning", "Invalid token format detected")
-                return
-
-            # Example: Make a simple Discord API request to validate token
-            headers = {
-                "Authorization": token if token.startswith("Bot ") else token,
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-
-            # Test with Discord API - get current user
-            response = requests.get("https://discord.com/api/v10/users/@me", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                user_data = response.json()
-                username = user_data.get("username", "Unknown")
-                user_id = user_data.get("id", "Unknown")
-                
-                result = {
-                    "status": "success", 
-                    "username": username,
-                    "user_id": user_id,
-                    "token": token[:20] + "...",  # Partial token for logging
-                    "server_join": None
-                }
-                
-                logging.info(f"Token {token_index} valid - User: {username}#{user_data.get('discriminator', '0000')}")
-                
-                # Join server if invite is provided
-                if self.server_invite:
-                    logging.info(f"Token {token_index} attempting to join server...")
-                    join_result = self.join_discord_server(token, token_index, self.server_invite)
-                    result["server_join"] = join_result
-                
-                self.results[token_index] = result
-                
-                if self.debug_webhook:
-                    details = f"Token validated successfully\nUser: {username}#{user_data.get('discriminator', '0000')}\nID: {user_id}"
-                    if self.server_invite and result.get("server_join"):
-                        join_status = result["server_join"].get("status", "unknown")
-                        details += f"\nServer Join: {join_status}"
-                    
-                    self.debug_webhook.send_token_event(token_index, "success", details)
-
-            elif response.status_code == 401:
-                logging.error(f"Token {token_index} is invalid or expired")
-                self.results[token_index] = {"status": "error", "message": "Invalid/expired token"}
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "error", "Token is invalid or expired")
-
-            elif response.status_code == 429:
-                logging.warning(f"Token {token_index} rate limited")
-                self.results[token_index] = {"status": "error", "message": "Rate limited"}
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "warning", "Token is rate limited")
-
-            else:
-                logging.error(f"Token {token_index} failed with status {response.status_code}")
-                self.results[token_index] = {"status": "error", "message": f"HTTP {response.status_code}"}
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(token_index, "error", f"HTTP {response.status_code}: {response.text[:100]}")
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error for token {token_index}: {e}")
-            self.results[token_index] = {"status": "error", "message": f"Network error: {str(e)}"}
-            
-            if self.debug_webhook:
-                self.debug_webhook.send_token_event(token_index, "error", f"Network error: {str(e)}")
-
-        except Exception as e:
-            logging.error(f"Unexpected error for token {token_index}: {e}")
-            self.results[token_index] = {"status": "error", "message": f"Unexpected error: {str(e)}"}
-            
-            if self.debug_webhook:
-                self.debug_webhook.send_token_event(token_index, "error", f"Unexpected error: {str(e)}")
-
-    def run_parallel(self, max_threads: int = 10, delay_between_tokens: float = 3.0):
-        """Run token processing in parallel with thread limit and delay"""
-        logging.info(f"Starting parallel processing with max {max_threads} threads, {delay_between_tokens}s delay")
-        
-        if self.server_invite:
-            logging.info(f"Will attempt to join server: {self.server_invite}")
+    def start_all_clients(self):
+        """Start Discord clients for all tokens"""
+        logging.info(f"Starting online clients for {len(self.tokens)} tokens...")
         
         if self.debug_webhook:
             self.debug_webhook.send_startup(len(self.tokens))
 
-        def worker():
-            while True:
-                try:
-                    token_index, token = thread_queue.get(timeout=1)
-                    if token_index is None:  # Sentinel to stop
-                        break
-                    
-                    self.process_token(token, token_index)
-                    time.sleep(delay_between_tokens)  # Rate limiting
-                    thread_queue.task_done()
-                    
-                except:
-                    break
+        for i, token in enumerate(self.tokens, 1):
+            logging.info(f"Starting client {i}/{len(self.tokens)}...")
+            
+            client = DiscordClient(token, i)
+            
+            def run_client(c=client):
+                c.connect()
 
-        # Create queue and start worker threads
-        import queue
-        thread_queue = queue.Queue()
-        
-        # Start worker threads
-        threads = []
-        for _ in range(min(max_threads, len(self.tokens))):
-            thread = threading.Thread(target=worker, daemon=True)
+            thread = threading.Thread(target=run_client, daemon=True)
             thread.start()
-            threads.append(thread)
 
-        # Add tokens to queue
-        for i, token in enumerate(self.tokens, 1):
-            thread_queue.put((i, token))
+            self.clients.append(client)
+            self.threads.append(thread)
+            
+            # Stagger connections to avoid rate limits
+            if i < len(self.tokens):
+                time.sleep(5)
 
-        # Wait for all tasks to complete
-        thread_queue.join()
+        logging.info(f"All {len(self.clients)} clients started!")
+        return self.monitor_clients()
 
-        # Stop worker threads
-        for _ in threads:
-            thread_queue.put((None, None))
-
-        # Wait for threads to finish
-        for thread in threads:
-            thread.join(timeout=5)
-
-        logging.info("All tokens processed!")
-        return self.results
-
-    def run_sequential(self, delay_between_tokens: float = 3.0):
-        """Run token processing sequentially with delay"""
-        logging.info(f"Starting sequential processing with {delay_between_tokens}s delay")
+    def monitor_clients(self):
+        """Monitor client health and provide status updates"""
+        logging.info("Monitoring connections... Press Ctrl+C to stop all clients")
         
-        if self.server_invite:
-            logging.info(f"Will attempt to join server: {self.server_invite}")
+        try:
+            while not self.should_stop:
+                # Count connected clients
+                connected_count = sum(1 for c in self.clients if c.connected and not c.should_stop)
+                total_count = len(self.clients)
+                
+                # Log status every 5 minutes
+                logging.info(f"Status: {connected_count}/{total_count} clients online")
+                
+                # Check for dead threads and restart if needed
+                for i, (client, thread) in enumerate(zip(self.clients, self.threads)):
+                    if not thread.is_alive() and not client.should_stop:
+                        logging.warning(f"Thread for token {client.token_index} died, restarting...")
+                        self.restart_client(i)
+                
+                # Wait 5 minutes before next check
+                time.sleep(300)
+
+        except KeyboardInterrupt:
+            logging.info("Shutdown requested by user")
+            self.stop_all_clients()
+        
+        return True
+
+    def restart_client(self, client_index: int):
+        """Restart a specific client"""
+        try:
+            old_client = self.clients[client_index]
+            old_client.stop()
+            
+            # Wait for cleanup
+            time.sleep(3)
+            
+            # Create new client with same token
+            token = self.tokens[client_index]
+            new_client = DiscordClient(token, client_index + 1)
+            
+            def run_new_client():
+                new_client.connect()
+
+            new_thread = threading.Thread(target=run_new_client, daemon=True)
+            new_thread.start()
+            
+            self.clients[client_index] = new_client
+            self.threads[client_index] = new_thread
+            
+            logging.info(f"Restarted client for token {client_index + 1}")
+            
+        except Exception as e:
+            logging.error(f"Failed to restart client {client_index + 1}: {e}")
+
+    def stop_all_clients(self):
+        """Stop all clients"""
+        logging.info("Stopping all clients...")
+        self.should_stop = True
+        
+        for client in self.clients:
+            client.stop()
+        
+        # Wait a moment for graceful shutdown
+        time.sleep(2)
         
         if self.debug_webhook:
-            self.debug_webhook.send_startup(len(self.tokens))
+            self.debug_webhook.send_shutdown()
+        
+        logging.info("All clients stopped")
 
-        for i, token in enumerate(self.tokens, 1):
-            self.process_token(token, i)
-            
-            # Add delay between tokens (except for the last one)
-            if i < len(self.tokens):
-                time.sleep(delay_between_tokens)
+    def get_status(self):
+        """Get current status of all clients"""
+        status = {
+            "total": len(self.clients),
+            "connected": sum(1 for c in self.clients if c.connected),
+            "healthy": sum(1 for c in self.clients if c.is_healthy()),
+            "clients": []
+        }
+        
+        for client in self.clients:
+            client_status = {
+                "token_index": client.token_index,
+                "connected": client.connected,
+                "healthy": client.is_healthy(),
+                "username": client.user_data.get("username") if client.user_data else None
+            }
+            status["clients"].append(client_status)
+        
+        return status
 
-        logging.info("All tokens processed!")
-        return self.results
 
-    def print_summary(self):
-        """Print a summary of results"""
-        if not self.results:
-            logging.info("No results to summarize")
-            return
-
-        successful = sum(1 for r in self.results.values() if r.get("status") == "success")
-        failed = len(self.results) - successful
-
-        print("\n" + "="*50)
-        print("TOKEN PROCESSING SUMMARY")
-        print("="*50)
-        print(f"Total Tokens: {len(self.results)}")
-        print(f"Successful: {successful}")
-        print(f"Failed: {failed}")
-        print(f"Success Rate: {(successful/len(self.results)*100):.1f}%")
-        print("="*50)
-
-        # Print successful tokens
-        if successful > 0:
-            print("\nSUCCESSFUL TOKENS:")
-            print("-" * 30)
-            for token_index, result in self.results.items():
-                if result.get("status") == "success":
-                    username = result.get("username", "Unknown")
-                    user_id = result.get("user_id", "Unknown")
-                    
-                    # Check server join status
-                    server_info = ""
-                    if result.get("server_join"):
-                        join_status = result["server_join"].get("status", "unknown")
-                        if join_status == "success":
-                            server_name = result["server_join"].get("server_name", "Unknown")
-                            server_info = f" | Joined: {server_name}"
-                        elif join_status == "already_joined":
-                            server_info = " | Already in server"
-                        else:
-                            join_msg = result["server_join"].get("message", "Failed")
-                            server_info = f" | Join failed: {join_msg}"
-                    
-                    print(f"Token {token_index}: {username} (ID: {user_id}){server_info}")
-
-        # Print failed tokens
-        if failed > 0:
-            print(f"\nFAILED TOKENS ({failed}):")
-            print("-" * 30)
-            for token_index, result in self.results.items():
-                if result.get("status") != "success":
-                    message = result.get("message", "Unknown error")
-                    print(f"Token {token_index}: {message}")
-
-        print("="*50 + "\n")
-
-# -------------------- MAIN FUNCTION --------------------
-def main():
-    """Main function - customize this for your specific use case"""
-    
-    # Configuration
-    CONFIG_FILE = "tokens.json"
-    DEBUG_WEBHOOK_URL = None  # Will be loaded from config if available
+# -------------------- CONFIGURATION --------------------
+def load_config(config_path: str = "tokens.json"):
+    """Load configuration from JSON file"""
+    if not os.path.exists(config_path):
+        return None
     
     try:
-        # Initialize manager
-        manager = MultiTokenManager([], DEBUG_WEBHOOK_URL)
-        
-        # Check if config file exists
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        logging.error(f"Invalid JSON in {config_path}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error loading {config_path}: {e}")
+        return None
+
+
+def create_example_config(config_path: str = "tokens.json"):
+    """Create example configuration file"""
+    example_config = {
+        "debug_webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL_HERE",
+        "tokens": [
+            "YOUR_DISCORD_TOKEN_1_HERE",
+            "YOUR_DISCORD_TOKEN_2_HERE",
+            "YOUR_DISCORD_TOKEN_3_HERE",
+            "YOUR_DISCORD_TOKEN_4_HERE",
+            "YOUR_DISCORD_TOKEN_5_HERE"
+        ]
+    }
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(example_config, f, indent=2, ensure_ascii=False)
+
+    logging.info(f"Created example {config_path}")
+
+
+def extract_tokens(config: dict) -> List[str]:
+    """Extract tokens from configuration"""
+    tokens = []
+    
+    if "tokens" in config and isinstance(config["tokens"], list):
+        for token in config["tokens"]:
+            if isinstance(token, str) and len(token.strip()) > 20:
+                tokens.append(token.strip())
+    
+    return tokens
+
+
+# -------------------- MAIN --------------------
+def main():
+    """Main function"""
+    CONFIG_FILE = "tokens.json"
+    
+    try:
+        # Check for config file
         if not os.path.exists(CONFIG_FILE):
-            logging.info(f"{CONFIG_FILE} not found, creating example configuration...")
-            manager.create_example_config(CONFIG_FILE)
-            print(f"\nPlease edit {CONFIG_FILE} and add your tokens, then run the script again.")
+            logging.info(f"{CONFIG_FILE} not found, creating example...")
+            create_example_config(CONFIG_FILE)
+            print(f"\nExample configuration created: {CONFIG_FILE}")
+            print("Please edit the file with your tokens and webhook URL, then run again.")
             return
 
         # Load configuration
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                
-                # Get debug webhook URL if available
-                if isinstance(config, dict) and "debug_webhook_url" in config:
-                    DEBUG_WEBHOOK_URL = config["debug_webhook_url"]
-                    if DEBUG_WEBHOOK_URL and DEBUG_WEBHOOK_URL.startswith("https://"):
-                        manager.debug_webhook = DebugWebhookManager(DEBUG_WEBHOOK_URL)
-                        global debug_webhook
-                        debug_webhook = manager.debug_webhook
-                        logging.info("Debug webhook enabled")
-                
-                # Get server invite if available
-                SERVER_INVITE = None
-                if isinstance(config, dict) and "server_invite" in config:
-                    SERVER_INVITE = config["server_invite"]
-                    if SERVER_INVITE and ("discord.gg/" in SERVER_INVITE or "discord.com/invite/" in SERVER_INVITE):
-                        logging.info(f"Server invite loaded: {SERVER_INVITE}")
-                    else:
-                        logging.warning("Invalid server invite format in config")
-                        SERVER_INVITE = None
-
-        # Load tokens from config
-        tokens = manager.load_tokens_from_config(CONFIG_FILE)
-        
-        if not tokens:
-            logging.error("No valid tokens found in configuration!")
-            print(f"Please add your tokens to {CONFIG_FILE}")
+        config = load_config(CONFIG_FILE)
+        if not config:
+            logging.error("Failed to load configuration")
             return
 
-        # Update manager with loaded tokens and server invite
-        manager.tokens = tokens
-        manager.server_invite = SERVER_INVITE
+        # Extract tokens
+        tokens = extract_tokens(config)
+        if not tokens:
+            logging.error("No valid tokens found in configuration")
+            print(f"Please add your Discord tokens to {CONFIG_FILE}")
+            return
+
+        # Get debug webhook URL
+        debug_webhook_url = config.get("debug_webhook_url")
+        if debug_webhook_url and not debug_webhook_url.startswith("https://"):
+            debug_webhook_url = None
+
+        # Initialize manager
+        manager = OnlineManager(tokens, debug_webhook_url)
         
         print(f"\nLoaded {len(tokens)} tokens")
-        if SERVER_INVITE:
-            print(f"Server invite: {SERVER_INVITE}")
-        print("Choose processing mode:")
-        print("1. Parallel (faster, max 10 concurrent)")
-        print("2. Sequential (safer, slower)")
-        
-        choice = input("Enter choice (1 or 2): ").strip()
-        
-        if choice == "1":
-            print("Running in parallel mode...")
-            results = manager.run_parallel(max_threads=10, delay_between_tokens=3.0)
+        if debug_webhook_url:
+            print("Debug webhook: enabled")
         else:
-            print("Running in sequential mode...")
-            results = manager.run_sequential(delay_between_tokens=3.0)
+            print("Debug webhook: disabled")
         
-        # Print summary
-        manager.print_summary()
+        print("\nStarting Discord Online Manager...")
+        print("All tokens will be kept online until you press Ctrl+C")
         
-        # Save results to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = f"token_results_{timestamp}.json"
+        # Setup signal handlers
+        def signal_handler(signum, frame):
+            logging.info(f"Received signal {signum}, shutting down...")
+            manager.stop_all_clients()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
         
-        with open(results_file, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        
-        logging.info(f"Results saved to {results_file}")
-        
-        if debug_webhook:
-            debug_webhook.send_shutdown("Processing completed successfully")
+        # Start and monitor clients
+        manager.start_all_clients()
 
     except KeyboardInterrupt:
-        logging.info("Script interrupted by user")
-        if debug_webhook:
-            debug_webhook.send_shutdown("Script interrupted by user")
-    
+        logging.info("Interrupted by user")
     except Exception as e:
         logging.error(f"Script error: {e}")
         if debug_webhook:
             debug_webhook.send_debug("Script Error", f"Unexpected error: {str(e)}", color=0xFF0000)
+
 
 if __name__ == "__main__":
     main()
