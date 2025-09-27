@@ -43,7 +43,7 @@ class DebugWebhookManager:
                     "title": f"🟢 {title}",
                     "description": description[:4000],
                     "color": color,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
                     "footer": {"text": "Discord Online Manager"}
                 }
 
