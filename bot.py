@@ -39,11 +39,11 @@ class DiscordClient:
         """Connect to Discord gateway"""
         self.should_stop = False
         self.connected = False
-        
+
         while not self.should_stop and self.reconnect_attempts < self.max_reconnect_attempts:
             try:
                 logging.info(f"[Token {self.token_index}] Connecting to Discord...")
-                
+
                 self.ws = websocket.WebSocketApp(
                     DISCORD_GATEWAY,
                     on_open=self.on_open,
@@ -52,21 +52,22 @@ class DiscordClient:
                     on_close=self.on_close
                 )
                 self.ws.run_forever()
-                
+
                 # If we reach here, connection was closed
                 if not self.should_stop:
                     self.reconnect_attempts += 1
                     if self.reconnect_attempts < self.max_reconnect_attempts:
                         wait_time = min(30, 5 * self.reconnect_attempts)
-                        logging.info(f"[Token {self.token_index}] Reconnecting in {wait_time}s... (attempt {self.reconnect_attempts})")
+                        logging.info(
+                            f"[Token {self.token_index}] Reconnecting in {wait_time}s... (attempt {self.reconnect_attempts})")
                         time.sleep(wait_time)
                     else:
                         logging.error(f"[Token {self.token_index}] Max reconnect attempts reached")
                         break
-                        
+
             except Exception as e:
                 logging.error(f"[Token {self.token_index}] Connection failed: {e}")
-                
+
                 if not self.should_stop:
                     self.reconnect_attempts += 1
                     if self.reconnect_attempts < self.max_reconnect_attempts:
@@ -119,7 +120,7 @@ class DiscordClient:
             if op == 10:  # Hello - start heartbeat
                 self.heartbeat_interval = data["heartbeat_interval"]
                 logging.info(f"[Token {self.token_index}] Starting heartbeat ({self.heartbeat_interval}ms)")
-                
+
                 if self.heartbeat_thread:
                     self.heartbeat_thread = None
                 self.heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
@@ -176,7 +177,7 @@ class OnlineManager:
         self.clients = []
         self.threads = []
         self.should_stop = False
-        
+
         logging.info(f"Initialized OnlineManager with {len(self.tokens)} tokens")
 
     def start_all_clients(self):
@@ -185,9 +186,9 @@ class OnlineManager:
 
         for i, token in enumerate(self.tokens, 1):
             logging.info(f"Starting client {i}/{len(self.tokens)}...")
-            
+
             client = DiscordClient(token, i)
-            
+
             def run_client(c=client):
                 c.connect()
 
@@ -196,7 +197,7 @@ class OnlineManager:
 
             self.clients.append(client)
             self.threads.append(thread)
-            
+
             # Stagger connections to avoid rate limits
             if i < len(self.tokens):
                 time.sleep(5)
@@ -207,29 +208,29 @@ class OnlineManager:
     def monitor_clients(self):
         """Monitor client health and provide status updates"""
         logging.info("Monitoring connections... Press Ctrl+C to stop all clients")
-        
+
         try:
             while not self.should_stop:
                 # Count connected clients
                 connected_count = sum(1 for c in self.clients if c.connected and not c.should_stop)
                 total_count = len(self.clients)
-                
+
                 # Log status every 5 minutes
                 logging.info(f"Status: {connected_count}/{total_count} clients online")
-                
+
                 # Check for dead threads and restart if needed
                 for i, (client, thread) in enumerate(zip(self.clients, self.threads)):
                     if not thread.is_alive() and not client.should_stop:
                         logging.warning(f"Thread for token {client.token_index} died, restarting...")
                         self.restart_client(i)
-                
+
                 # Wait 5 minutes before next check
                 time.sleep(300)
 
         except KeyboardInterrupt:
             logging.info("Shutdown requested by user")
             self.stop_all_clients()
-        
+
         return True
 
     def restart_client(self, client_index: int):
@@ -237,25 +238,25 @@ class OnlineManager:
         try:
             old_client = self.clients[client_index]
             old_client.stop()
-            
+
             # Wait for cleanup
             time.sleep(3)
-            
+
             # Create new client with same token
             token = self.tokens[client_index]
             new_client = DiscordClient(token, client_index + 1)
-            
+
             def run_new_client():
                 new_client.connect()
 
             new_thread = threading.Thread(target=run_new_client, daemon=True)
             new_thread.start()
-            
+
             self.clients[client_index] = new_client
             self.threads[client_index] = new_thread
-            
+
             logging.info(f"Restarted client for token {client_index + 1}")
-            
+
         except Exception as e:
             logging.error(f"Failed to restart client {client_index + 1}: {e}")
 
@@ -263,10 +264,10 @@ class OnlineManager:
         """Stop all clients"""
         logging.info("Stopping all clients...")
         self.should_stop = True
-        
+
         for client in self.clients:
             client.stop()
-        
+
         # Wait a moment for graceful shutdown
         time.sleep(2)
         logging.info("All clients stopped")
@@ -279,7 +280,7 @@ class OnlineManager:
             "healthy": sum(1 for c in self.clients if c.is_healthy()),
             "clients": []
         }
-        
+
         for client in self.clients:
             client_status = {
                 "token_index": client.token_index,
@@ -288,7 +289,7 @@ class OnlineManager:
                 "username": client.user_data.get("username") if client.user_data else None
             }
             status["clients"].append(client_status)
-        
+
         return status
 
 
@@ -297,7 +298,7 @@ def load_config(config_path: str = "tokens.json"):
     """Load configuration from JSON file"""
     if not os.path.exists(config_path):
         return None
-    
+
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -330,12 +331,12 @@ def create_example_config(config_path: str = "tokens.json"):
 def extract_tokens(config: dict) -> List[str]:
     """Extract tokens from configuration"""
     tokens = []
-    
+
     if "tokens" in config and isinstance(config["tokens"], list):
         for token in config["tokens"]:
             if isinstance(token, str) and len(token.strip()) > 20:
                 tokens.append(token.strip())
-    
+
     return tokens
 
 
@@ -343,7 +344,7 @@ def extract_tokens(config: dict) -> List[str]:
 def main():
     """Main function"""
     CONFIG_FILE = "tokens.json"
-    
+
     try:
         # Check for config file
         if not os.path.exists(CONFIG_FILE):
@@ -368,11 +369,11 @@ def main():
 
         # Initialize manager
         manager = OnlineManager(tokens)
-        
+
         print(f"\nLoaded {len(tokens)} tokens")
         print("\nStarting Discord Online Manager...")
         print("All tokens will be kept online until you press Ctrl+C")
-        
+
         # Setup signal handlers
         def signal_handler(signum, frame):
             logging.info(f"Received signal {signum}, shutting down...")
@@ -381,7 +382,7 @@ def main():
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         # Start and monitor clients
         manager.start_all_clients()
 
