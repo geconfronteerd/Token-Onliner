@@ -86,5 +86,5 @@ pip install websocket-client
 
 ## Disclaimer
 
-This project is provided **for educational purposes only** to illustrate WebSocket client management, heartbeat handling, and reconnection logic.
-Do not use it to automate services that prohibit such usage.
+Please read the [Disclaimer](./DISCLAIMER.md) before using this project.  
+Use at your own risk. The author is not responsible for any consequences.
