@@ -2,11 +2,10 @@ import os
 import json
 import time
 import threading
-import requests
 import websocket
 import logging
 from datetime import datetime
-from typing import List, Dict
+from typing import List
 import signal
 import sys
 
@@ -19,95 +18,6 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
-
-# Global debug webhook manager
-debug_webhook = None
-
-
-# -------------------- DEBUG WEBHOOK MANAGER --------------------
-class DebugWebhookManager:
-    def __init__(self, webhook_url: str = None):
-        self.webhook_url = webhook_url
-        self.enabled = bool(webhook_url)
-        self.max_retries = 3
-        self.retry_delay = 2
-
-    def send_debug(self, title: str, description: str, color: int = 0xFF5555, fields: List[Dict] = None):
-        """Send debug message to webhook with retry logic"""
-        if not self.enabled:
-            return
-
-        for attempt in range(self.max_retries):
-            try:
-                embed = {
-                    "title": f"🟢 {title}",
-                    "description": description[:4000],
-                    "color": color,
-                    "timestamp": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-                    "footer": {"text": "Discord Online Manager"}
-                }
-
-                if fields:
-                    embed["fields"] = fields
-
-                payload = {
-                    "embeds": [embed],
-                    "username": "Discord Online Manager"
-                }
-
-                response = requests.post(
-                    self.webhook_url,
-                    json=payload,
-                    timeout=10,
-                    headers={'Content-Type': 'application/json'}
-                )
-
-                if response.status_code == 204:
-                    return
-                elif response.status_code == 429:
-                    retry_after = response.json().get('retry_after', self.retry_delay)
-                    logging.warning(f"Debug webhook rate limited, retrying after {retry_after}s")
-                    time.sleep(retry_after)
-                    continue
-                else:
-                    logging.warning(f"Debug webhook failed: {response.status_code}")
-
-            except Exception as e:
-                logging.error(f"Debug webhook error (attempt {attempt + 1}): {e}")
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
-
-    def send_startup(self, token_count: int):
-        """Send startup notification"""
-        self.send_debug(
-            "Online Manager Started",
-            f"Starting Discord Online Manager with {token_count} tokens",
-            color=0x00FF00,
-            fields=[
-                {"name": "Tokens", "value": str(token_count), "inline": True},
-                {"name": "Status", "value": "Starting", "inline": True}
-            ]
-        )
-
-    def send_token_event(self, token_index: int, event: str, details: str = ""):
-        """Send token event notification"""
-        colors = {
-            "connected": 0x00FF00,
-            "disconnected": 0xFF5555,
-            "error": 0xFF0000,
-            "reconnecting": 0xFFAA00,
-            "online": 0x00FF00
-        }
-
-        self.send_debug(
-            f"Token {token_index} - {event.title()}",
-            details or f"Token {token_index} {event}",
-            color=colors.get(event, 0x5865F2)
-        )
-
-    def send_shutdown(self):
-        """Send shutdown notification"""
-        self.send_debug("Online Manager Stopped", "All tokens have been disconnected", color=0xFFAA00)
 
 
 # -------------------- DISCORD CLIENT --------------------
@@ -124,9 +34,6 @@ class DiscordClient:
         self.user_data = None
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
-
-        global debug_webhook
-        self.debug_webhook = debug_webhook
 
     def connect(self):
         """Connect to Discord gateway"""
@@ -155,18 +62,10 @@ class DiscordClient:
                         time.sleep(wait_time)
                     else:
                         logging.error(f"[Token {self.token_index}] Max reconnect attempts reached")
-                        if self.debug_webhook:
-                            self.debug_webhook.send_token_event(
-                                self.token_index, 
-                                "error", 
-                                "Max reconnect attempts reached - giving up"
-                            )
                         break
                         
             except Exception as e:
                 logging.error(f"[Token {self.token_index}] Connection failed: {e}")
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(self.token_index, "error", f"Connection failed: {str(e)}")
                 
                 if not self.should_stop:
                     self.reconnect_attempts += 1
@@ -199,9 +98,6 @@ class DiscordClient:
         logging.info(f"[Token {self.token_index}] Connected to Discord Gateway")
         self.connected = True
         self.reconnect_attempts = 0  # Reset on successful connection
-        
-        if self.debug_webhook:
-            self.debug_webhook.send_token_event(self.token_index, "connected", "Connected to Discord Gateway")
 
     def heartbeat(self):
         """Send heartbeat to keep connection alive"""
@@ -236,9 +132,9 @@ class DiscordClient:
                         "token": self.token,
                         "intents": 513,  # Basic intents for staying online
                         "properties": {
-                            "os": "linux",
-                            "browser": "custom",
-                            "device": "custom"
+                            "$os": "Windows",
+                            "$browser": "Discord Client",
+                            "$device": "desktop"
                         },
                         "presence": {
                             "status": "online",
@@ -255,13 +151,6 @@ class DiscordClient:
                 self.user_data = user
                 username = f"{user['username']}#{user.get('discriminator', '0000')}"
                 logging.info(f"[Token {self.token_index}] Now online as {username}")
-                
-                if self.debug_webhook:
-                    self.debug_webhook.send_token_event(
-                        self.token_index, 
-                        "online", 
-                        f"Successfully online as {username}\nID: {user['id']}"
-                    )
 
             elif op == 11:  # Heartbeat ACK
                 # Heartbeat acknowledged - connection is healthy
@@ -274,41 +163,25 @@ class DiscordClient:
 
     def on_error(self, ws, error):
         logging.error(f"[Token {self.token_index}] WebSocket error: {error}")
-        if self.debug_webhook:
-            self.debug_webhook.send_token_event(self.token_index, "error", f"WebSocket error: {str(error)}")
 
     def on_close(self, ws, code, msg):
         self.connected = False
         logging.warning(f"[Token {self.token_index}] Connection closed (code: {code}, message: {msg})")
-        
-        if self.debug_webhook and not self.should_stop:
-            self.debug_webhook.send_token_event(
-                self.token_index, 
-                "disconnected", 
-                f"Connection closed - Code: {code}"
-            )
 
 
 # -------------------- ONLINE MANAGER --------------------
 class OnlineManager:
-    def __init__(self, tokens: List[str], debug_webhook_url: str = None):
+    def __init__(self, tokens: List[str]):
         self.tokens = tokens
-        self.debug_webhook = DebugWebhookManager(debug_webhook_url)
         self.clients = []
         self.threads = []
         self.should_stop = False
-        
-        global debug_webhook
-        debug_webhook = self.debug_webhook
         
         logging.info(f"Initialized OnlineManager with {len(self.tokens)} tokens")
 
     def start_all_clients(self):
         """Start Discord clients for all tokens"""
         logging.info(f"Starting online clients for {len(self.tokens)} tokens...")
-        
-        if self.debug_webhook:
-            self.debug_webhook.send_startup(len(self.tokens))
 
         for i, token in enumerate(self.tokens, 1):
             logging.info(f"Starting client {i}/{len(self.tokens)}...")
@@ -396,10 +269,6 @@ class OnlineManager:
         
         # Wait a moment for graceful shutdown
         time.sleep(2)
-        
-        if self.debug_webhook:
-            self.debug_webhook.send_shutdown()
-        
         logging.info("All clients stopped")
 
     def get_status(self):
@@ -443,7 +312,6 @@ def load_config(config_path: str = "tokens.json"):
 def create_example_config(config_path: str = "tokens.json"):
     """Create example configuration file"""
     example_config = {
-        "debug_webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL_HERE",
         "tokens": [
             "YOUR_DISCORD_TOKEN_1_HERE",
             "YOUR_DISCORD_TOKEN_2_HERE",
@@ -482,7 +350,7 @@ def main():
             logging.info(f"{CONFIG_FILE} not found, creating example...")
             create_example_config(CONFIG_FILE)
             print(f"\nExample configuration created: {CONFIG_FILE}")
-            print("Please edit the file with your tokens and webhook URL, then run again.")
+            print("Please edit the file with your tokens, then run again.")
             return
 
         # Load configuration
@@ -498,20 +366,10 @@ def main():
             print(f"Please add your Discord tokens to {CONFIG_FILE}")
             return
 
-        # Get debug webhook URL
-        debug_webhook_url = config.get("debug_webhook_url")
-        if debug_webhook_url and not debug_webhook_url.startswith("https://"):
-            debug_webhook_url = None
-
         # Initialize manager
-        manager = OnlineManager(tokens, debug_webhook_url)
+        manager = OnlineManager(tokens)
         
         print(f"\nLoaded {len(tokens)} tokens")
-        if debug_webhook_url:
-            print("Debug webhook: enabled")
-        else:
-            print("Debug webhook: disabled")
-        
         print("\nStarting Discord Online Manager...")
         print("All tokens will be kept online until you press Ctrl+C")
         
@@ -531,8 +389,6 @@ def main():
         logging.info("Interrupted by user")
     except Exception as e:
         logging.error(f"Script error: {e}")
-        if debug_webhook:
-            debug_webhook.send_debug("Script Error", f"Unexpected error: {str(e)}", color=0xFF0000)
 
 
 if __name__ == "__main__":
